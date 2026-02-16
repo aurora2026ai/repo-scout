@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+#
+# repo-scout — Instant overview of any project
+#
+# Usage: repo-scout [path]
+#   path — Path to a project directory (default: current directory)
+#
+# Detects project type, structure, dependencies, build commands,
+# and key files. No AI, no network, no dependencies beyond bash and git.
+
+set -eo pipefail
+
+DIR="${1:-.}"
+
+if ! cd "$DIR" 2>/dev/null; then
+    echo "Error: Cannot access '$DIR'" >&2
+    exit 1
+fi
+
+DIR=$(pwd)
+PROJECT=$(basename "$DIR")
+
+# Colors (disabled if not a terminal)
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    CYAN='\033[36m'
+    YELLOW='\033[33m'
+    GREEN='\033[32m'
+    MAGENTA='\033[35m'
+    RESET='\033[0m'
+else
+    BOLD='' DIM='' CYAN='' YELLOW='' GREEN='' MAGENTA='' RESET=''
+fi
+
+# --- Detect project type ---
+detect_type() {
+    local types=()
+
+    [ -f "package.json" ] && types+=("Node.js") || true
+    [ -f "Cargo.toml" ] && types+=("Rust") || true
+    [ -f "go.mod" ] && types+=("Go") || true
+    { [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "setup.cfg" ] || [ -f "Pipfile" ] || [ -f "requirements.txt" ]; } && types+=("Python") || true
+    [ -f "Gemfile" ] && types+=("Ruby") || true
+    { [ -f "pom.xml" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; } && types+=("Java/Kotlin") || true
+    [ -f "composer.json" ] && types+=("PHP") || true
+    [ -f "mix.exs" ] && types+=("Elixir") || true
+    { [ -f "CMakeLists.txt" ] || [ -f "Makefile" ]; } && types+=("C/C++") || true
+    [ -f "Package.swift" ] && types+=("Swift") || true
+    [ -f "pubspec.yaml" ] && types+=("Dart/Flutter") || true
+    { [ -f "deno.json" ] || [ -f "deno.jsonc" ]; } && types+=("Deno") || true
+    [ -f "bun.lockb" ] && types+=("Bun") || true
+
+    # Detect language variants
+    if [ ${#types[@]} -gt 0 ] && [[ " ${types[*]} " == *"Node.js"* ]]; then
+        if [ -f "tsconfig.json" ]; then
+            types+=("TypeScript")
+        else
+            types+=("JavaScript")
+        fi
+    fi
+
+    # Detect frameworks
+    if [ -f "package.json" ]; then
+        local pkg
+        pkg=$(cat package.json 2>/dev/null)
+        echo "$pkg" | grep -q '"next"' && types+=("Next.js") || true
+        echo "$pkg" | grep -q '"react"' && types+=("React") || true
+        echo "$pkg" | grep -q '"vue"' && types+=("Vue") || true
+        echo "$pkg" | grep -q '"svelte"' && types+=("Svelte") || true
+        echo "$pkg" | grep -q '"angular"' && types+=("Angular") || true
+        echo "$pkg" | grep -q '"express"' && types+=("Express") || true
+        echo "$pkg" | grep -q '"fastify"' && types+=("Fastify") || true
+        echo "$pkg" | grep -q '"electron"' && types+=("Electron") || true
+    fi
+
+    if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+        local reqs=""
+        [ -f "requirements.txt" ] && reqs=$(cat requirements.txt 2>/dev/null)
+        [ -f "pyproject.toml" ] && reqs="$reqs $(cat pyproject.toml 2>/dev/null)"
+        echo "$reqs" | grep -qi 'django' && types+=("Django") || true
+        echo "$reqs" | grep -qi 'flask' && types+=("Flask") || true
+        echo "$reqs" | grep -qi 'fastapi' && types+=("FastAPI") || true
+        echo "$reqs" | grep -qi 'pytorch\|torch' && types+=("PyTorch") || true
+        echo "$reqs" | grep -qi 'tensorflow' && types+=("TensorFlow") || true
+    fi
+
+    if [ ${#types[@]} -eq 0 ]; then
+        # Try to detect from file extensions
+        local exts
+        exts=$(find . -maxdepth 3 -type f -name "*.??*" ! -path "./.git/*" ! -path "./node_modules/*" ! -path "./.venv/*" ! -path "./vendor/*" 2>/dev/null | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -3 | awk '{print $2}')
+        if [ -n "$exts" ]; then
+            for ext in $exts; do
+                case "$ext" in
+                    py) types+=("Python") ;;
+                    js|jsx|mjs) types+=("JavaScript") ;;
+                    ts|tsx) types+=("TypeScript") ;;
+                    rs) types+=("Rust") ;;
+                    go) types+=("Go") ;;
+                    rb) types+=("Ruby") ;;
+                    java) types+=("Java") ;;
+                    cs) types+=("C#") ;;
+                    cpp|cc|cxx) types+=("C++") ;;
+                    c|h) types+=("C") ;;
+                    sh) types+=("Shell") ;;
+                esac
+            done
+        fi
+    fi
+
+    # Deduplicate
+    if [ ${#types[@]} -gt 0 ]; then
+        printf '%s\n' "${types[@]}" | awk '!seen[$0]++' | paste -sd ', ' -
+    fi
+}
+
+# --- Count files and lines ---
+count_project() {
+    local file_count line_count
+    file_count=$(find . -type f ! -path "./.git/*" ! -path "./node_modules/*" ! -path "./.venv/*" ! -path "./venv/*" ! -path "./__pycache__/*" ! -path "./vendor/*" ! -path "./target/*" ! -path "./build/*" ! -path "./dist/*" ! -path "./.next/*" ! -path "./coverage/*" 2>/dev/null | wc -l)
+
+    # Count lines only in text files (skip binaries)
+    local code_files
+    code_files=$(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" -o -name "*.rs" -o -name "*.go" -o -name "*.rb" -o -name "*.java" -o -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.cs" -o -name "*.php" -o -name "*.sh" -o -name "*.bash" -o -name "*.css" -o -name "*.scss" -o -name "*.html" -o -name "*.vue" -o -name "*.svelte" -o -name "*.ex" -o -name "*.exs" -o -name "*.swift" -o -name "*.kt" -o -name "*.dart" -o -name "*.yaml" -o -name "*.yml" -o -name "*.toml" -o -name "*.json" -o -name "*.md" -o -name "*.txt" -o -name "*.xml" \) ! -path "./.git/*" ! -path "./node_modules/*" ! -path "./.venv/*" ! -path "./venv/*" ! -path "./__pycache__/*" ! -path "./vendor/*" ! -path "./target/*" ! -path "./build/*" ! -path "./dist/*" ! -path "./.next/*" 2>/dev/null || true)
+    if [ -n "$code_files" ]; then
+        line_count=$(echo "$code_files" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
+    else
+        line_count=0
+    fi
+
+    echo "${file_count:-0} files, ${line_count:-0} lines"
+}
+
+# --- Detect build/run commands ---
+detect_commands() {
+    local cmds=()
+
+    if [ -f "package.json" ]; then
+        local scripts
+        scripts=$(python3 -c "import json; d=json.load(open('package.json')); s=d.get('scripts',{}); [print(k,v) for k,v in s.items()]" 2>/dev/null || true)
+        if [ -n "$scripts" ]; then
+            local pm="npm"
+            [ -f "yarn.lock" ] && pm="yarn"
+            [ -f "pnpm-lock.yaml" ] && pm="pnpm"
+            [ -f "bun.lockb" ] && pm="bun"
+
+            while IFS=' ' read -r key val; do
+                case "$key" in
+                    start) cmds+=("Run: $pm start") ;;
+                    dev) cmds+=("Dev: $pm run dev") ;;
+                    build) cmds+=("Build: $pm run build") ;;
+                    test) cmds+=("Test: $pm test") ;;
+                    lint) cmds+=("Lint: $pm run lint") ;;
+                esac
+            done <<< "$scripts"
+        fi
+    fi
+
+    if [ -f "Cargo.toml" ]; then
+        cmds+=("Build: cargo build")
+        cmds+=("Run: cargo run")
+        cmds+=("Test: cargo test")
+    fi
+
+    if [ -f "go.mod" ]; then
+        cmds+=("Build: go build ./...")
+        cmds+=("Test: go test ./...")
+    fi
+
+    if [ -f "Makefile" ]; then
+        local targets
+        targets=$(grep -E '^[a-zA-Z_-]+:' Makefile 2>/dev/null | head -5 | sed 's/:.*//')
+        for t in $targets; do
+            case "$t" in
+                build|all) cmds+=("Build: make $t") ;;
+                test) cmds+=("Test: make test") ;;
+                run|start) cmds+=("Run: make $t") ;;
+                install) cmds+=("Install: make install") ;;
+                clean) cmds+=("Clean: make clean") ;;
+            esac
+        done
+    fi
+
+    if [ -f "pyproject.toml" ]; then
+        grep -q 'pytest' pyproject.toml 2>/dev/null && cmds+=("Test: pytest") || true
+        grep -q '\[tool.poetry\]' pyproject.toml 2>/dev/null && cmds+=("Install: poetry install") || true
+        grep -q '\[build-system\]' pyproject.toml 2>/dev/null && cmds+=("Build: pip install -e .") || true
+    fi
+
+    [ -f "requirements.txt" ] && cmds+=("Install: pip install -r requirements.txt") || true
+    [ -f "Pipfile" ] && cmds+=("Install: pipenv install") || true
+
+    if [ -f "Dockerfile" ] || [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ] || [ -f "compose.yml" ] || [ -f "compose.yaml" ]; then
+        [ -f "Dockerfile" ] && cmds+=("Docker: docker build -t $PROJECT .") || true
+        { [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ] || [ -f "compose.yml" ] || [ -f "compose.yaml" ]; } && cmds+=("Docker: docker compose up") || true
+    fi
+
+    if [ ${#cmds[@]} -gt 0 ]; then
+        printf '%s\n' "${cmds[@]}"
+    fi
+}
+
+# --- Detect entry points ---
+detect_entry() {
+    local entries=()
+
+    if [ -f "package.json" ]; then
+        local main
+        main=$(python3 -c "import json; d=json.load(open('package.json')); print(d.get('main',''))" 2>/dev/null || true)
+        [ -n "$main" ] && entries+=("$main")
+    fi
+
+    # Common entry points
+    for f in src/index.ts src/index.js src/main.ts src/main.js src/app.ts src/app.js \
+             index.ts index.js main.ts main.js app.ts app.js \
+             src/main.py main.py app.py manage.py \
+             src/main.rs src/lib.rs \
+             main.go cmd/main.go \
+             lib/main.dart; do
+        [ -f "$f" ] && entries+=("$f")
+    done
+
+    # Deduplicate and limit
+    if [ ${#entries[@]} -gt 0 ]; then
+        printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | head -3
+    fi
+}
+
+# --- Show dependencies ---
+show_deps() {
+    if [ -f "package.json" ]; then
+        local deps
+        deps=$(python3 -c "
+import json
+d = json.load(open('package.json'))
+prod = list(d.get('dependencies', {}).keys())
+dev = list(d.get('devDependencies', {}).keys())
+if prod:
+    print(f'  Prod ({len(prod)}): ' + ', '.join(prod[:8]) + ('...' if len(prod) > 8 else ''))
+if dev:
+    print(f'  Dev ({len(dev)}): ' + ', '.join(dev[:6]) + ('...' if len(dev) > 6 else ''))
+" 2>/dev/null || true)
+        [ -n "$deps" ] && echo "$deps"
+    fi
+
+    if [ -f "requirements.txt" ]; then
+        local count
+        count=$(grep -v '^\s*#' requirements.txt 2>/dev/null | grep -v '^\s*$' | wc -l)
+        local pkgs
+        pkgs=$(grep -v '^\s*#' requirements.txt 2>/dev/null | grep -v '^\s*$' | sed 's/[>=<].*//' | head -8 | paste -sd ', ' -)
+        [ -n "$pkgs" ] && echo "  Python ($count): $pkgs$([ "$count" -gt 8 ] && echo '...')"
+    fi
+
+    if [ -f "Cargo.toml" ]; then
+        local deps
+        deps=$(python3 -c "
+import re
+text = open('Cargo.toml').read()
+m = re.search(r'\[dependencies\](.*?)(\[|\Z)', text, re.DOTALL)
+if m:
+    lines = [l.strip().split('=')[0].strip().split(' ')[0] for l in m.group(1).strip().split('\n') if l.strip() and not l.strip().startswith('#')]
+    lines = [l for l in lines if l]
+    if lines:
+        print(f'  Crates ({len(lines)}): ' + ', '.join(lines[:8]) + ('...' if len(lines) > 8 else ''))
+" 2>/dev/null || true)
+        [ -n "$deps" ] && echo "$deps"
+    fi
+
+    if [ -f "go.mod" ]; then
+        local deps
+        deps=$(grep -E '^\s+[a-z]' go.mod 2>/dev/null | awk '{print $1}' | sed 's|.*/||' | head -8)
+        local count
+        count=$(grep -cE '^\s+[a-z]' go.mod 2>/dev/null || echo 0)
+        [ -n "$deps" ] && echo "  Go ($count): $(echo $deps | tr ' ' ', ')$([ "$count" -gt 8 ] && echo '...')"
+    fi
+}
+
+# --- Directory structure ---
+show_structure() {
+    # Get top-level directories with file counts, excluding common noise
+    local dirs
+    dirs=$(find . -maxdepth 1 -type d ! -name '.' ! -name '.git' ! -name 'node_modules' ! -name '.venv' ! -name 'venv' ! -name '__pycache__' ! -name '.next' ! -name '.cache' ! -name 'coverage' ! -name '.idea' ! -name '.vscode' ! -name 'target' ! -name 'vendor' 2>/dev/null | sort)
+
+    for d in $dirs; do
+        local name=${d#./}
+        local count
+        count=$(find "$d" -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/__pycache__/*" 2>/dev/null | wc -l)
+        [ "$count" -eq 0 ] && continue
+
+        # Try to guess what the directory is for
+        local desc=""
+        case "$name" in
+            src|lib|app) desc="source code" ;;
+            test|tests|spec|specs|__tests__) desc="tests" ;;
+            docs|doc|documentation) desc="documentation" ;;
+            config|conf|cfg) desc="configuration" ;;
+            scripts|bin|tools) desc="scripts/tools" ;;
+            public|static|assets|images|img) desc="static assets" ;;
+            components) desc="UI components" ;;
+            pages|views|routes) desc="pages/routes" ;;
+            api|server) desc="API/server" ;;
+            utils|helpers|common|shared) desc="utilities" ;;
+            styles|css) desc="styles" ;;
+            types|typings) desc="type definitions" ;;
+            migrations) desc="database migrations" ;;
+            fixtures|seed|seeds) desc="test fixtures/seeds" ;;
+            locales|i18n|translations) desc="translations" ;;
+            hooks) desc="hooks" ;;
+            middleware) desc="middleware" ;;
+            models) desc="data models" ;;
+            services) desc="service layer" ;;
+            store|stores|state) desc="state management" ;;
+            ci|.github|.circleci) desc="CI/CD" ;;
+            deploy|infra|terraform|k8s) desc="infrastructure" ;;
+            examples|example|demo) desc="examples" ;;
+        esac
+
+        if [ -n "$desc" ]; then
+            printf "  %-20s %4d files  (%s)\n" "$name/" "$count" "$desc"
+        else
+            printf "  %-20s %4d files\n" "$name/" "$count"
+        fi
+    done
+}
+
+# --- Key files ---
+show_key_files() {
+    local files=()
+
+    # Config and project files
+    for f in package.json tsconfig.json Cargo.toml go.mod pyproject.toml setup.py \
+             Makefile CMakeLists.txt Dockerfile docker-compose.yml docker-compose.yaml \
+             compose.yml compose.yaml .env.example .env.sample \
+             README.md CONTRIBUTING.md LICENSE CHANGELOG.md \
+             .github/workflows/*.yml .github/workflows/*.yaml \
+             .gitignore .editorconfig .prettierrc .eslintrc* \
+             CLAUDE.md .cursorrules; do
+        # Handle globs
+        for match in $f; do
+            [ -f "$match" ] && files+=("$match")
+        done
+    done
+
+    # Deduplicate and limit
+    if [ ${#files[@]} -gt 0 ]; then
+        printf '%s\n' "${files[@]}" | awk '!seen[$0]++' | head -12
+    fi
+}
+
+# --- Git info ---
+show_git_info() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local commit_count
+        commit_count=$(git rev-list --count HEAD 2>/dev/null || echo "?")
+        local last_commit
+        last_commit=$(git log -1 --format="%ar" 2>/dev/null || echo "unknown")
+        local contributors
+        contributors=$(git log --format="%an" 2>/dev/null | sort -u | wc -l)
+        local branch
+        branch=$(git branch --show-current 2>/dev/null || echo "detached")
+
+        echo "  Branch: $branch"
+        echo "  Commits: $commit_count (last: $last_commit)"
+        [ "$contributors" -gt 1 ] && echo "  Contributors: $contributors" || true
+
+        # Check for common CI
+        [ -d ".github/workflows" ] && echo "  CI: GitHub Actions" || true
+        [ -f ".gitlab-ci.yml" ] && echo "  CI: GitLab CI" || true
+        [ -f ".circleci/config.yml" ] && echo "  CI: CircleCI" || true
+        [ -f "Jenkinsfile" ] && echo "  CI: Jenkins" || true
+    fi
+}
+
+# ============================================================
+# Output
+# ============================================================
+
+echo ""
+echo -e "${BOLD}${CYAN}=== $PROJECT ===${RESET}"
+echo ""
+
+# Type
+TYPE=$(detect_type)
+if [ -n "$TYPE" ]; then
+    echo -e "${BOLD}Type:${RESET} $TYPE"
+fi
+
+# Size
+SIZE=$(count_project)
+echo -e "${BOLD}Size:${RESET} $SIZE"
+
+# Entry points
+ENTRIES=$(detect_entry)
+if [ -n "$ENTRIES" ]; then
+    echo -e "${BOLD}Entry:${RESET} $(echo "$ENTRIES" | head -1)"
+    echo "$ENTRIES" | tail -n +2 | while read -r e; do
+        echo "       $e"
+    done
+fi
+echo ""
+
+# Commands
+CMDS=$(detect_commands)
+if [ -n "$CMDS" ]; then
+    echo -e "${BOLD}Commands:${RESET}"
+    echo "$CMDS" | while read -r cmd; do
+        echo -e "  ${GREEN}$cmd${RESET}"
+    done
+    echo ""
+fi
+
+# Dependencies
+DEPS=$(show_deps)
+if [ -n "$DEPS" ]; then
+    echo -e "${BOLD}Dependencies:${RESET}"
+    echo "$DEPS"
+    echo ""
+fi
+
+# Structure
+STRUCTURE=$(show_structure)
+if [ -n "$STRUCTURE" ]; then
+    echo -e "${BOLD}Structure:${RESET}"
+    echo "$STRUCTURE"
+    echo ""
+fi
+
+# Key files
+KEY_FILES=$(show_key_files)
+if [ -n "$KEY_FILES" ]; then
+    echo -e "${BOLD}Key files:${RESET}"
+    echo "$KEY_FILES" | while read -r f; do
+        echo -e "  ${DIM}$f${RESET}"
+    done
+    echo ""
+fi
+
+# Git info
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo -e "${BOLD}Git:${RESET}"
+    show_git_info
+    echo ""
+fi
+
+echo -e "${DIM}---${RESET}"
+echo -e "${DIM}Scanned $(basename "$DIR") in $(pwd)${RESET}"
