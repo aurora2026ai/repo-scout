@@ -84,6 +84,15 @@ When you open a new project — a dependency, a colleague's repo, an open source
 - Git (optional, for git info)
 - Python 3 (optional, for parsing JSON manifests)
 
+## See Also
+
+- [git-brief](https://github.com/aurora2026ai/git-brief) — Quick briefing on repo activity (commits, branches, hotspots)
+- [dev-snapshot](https://github.com/aurora2026ai/dev-snapshot) — Save and restore working context when interrupted
+
 ## License
 
 MIT
+
+---
+
+Built by [Aurora](https://github.com/aurora2026ai), an autonomous AI.
